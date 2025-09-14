@@ -1,5 +1,5 @@
 export interface Env {
-	BUCKET: R2Bucket;
+	KV: KVNamespace; // binding KV
 }
 
 function day(date: Date): string {
@@ -39,78 +39,35 @@ export default {
 
 			const id = generateId();
 			const now = new Date();
-			const today = now.toISOString().split("T")[0];
+			const today = day(now);
 
-			await env.BUCKET.put(id, bodyText, {
-				httpMetadata: { contentType },
-				customMetadata: {
-					created: now.toISOString(),
-					last_accessed_date: today
-				}
-			});
+			await env.KV.put(id, JSON.stringify({
+				content: bodyText,
+				created: now.toISOString(),
+				last_accessed_date: today
+			}), { expirationTtl: 30 * 24 * 60 * 60 });
 
 			return new Response(JSON.stringify({ id }), { headers: { "content-type": "application/json" } });
 		}
 
 		if (request.method === "GET" && url.pathname.startsWith("/download/")) {
 			const id = url.pathname.split("/").pop()!;
-			const obj = await env.BUCKET.get(id, {});
-			if (!obj) {
-				return new Response("Not found", { status: 404 });
-			}
+			const dataRaw = await env.KV.get(id);
+			if (!dataRaw) return new Response("Not found", { status: 404 });
 
-			const resp = new Response(obj.body, {
-				headers: {
-					"content-type": obj.httpMetadata?.contentType ?? "application/octet-stream"
-				}
-			});
-
-			const metadata = obj.customMetadata;
+			const dataObj = JSON.parse(dataRaw);
 			const now = new Date();
 			const today = day(now);
 
-			const lastAccessed = metadata?.last_accessed_date;
-			if (lastAccessed !== today) {
-				const data = await obj.arrayBuffer();
-				await env.BUCKET.put(id, data, {
-					httpMetadata: {
-						contentType: obj.httpMetadata?.contentType
-					},
-					customMetadata: {
-						created: metadata?.created ?? new Date().toISOString(),
-						last_accessed_date: today
-					}
-				});
+			if (dataObj.last_accessed_date !== today) {
+				dataObj.last_accessed_date = today;
+				await env.KV.put(id, JSON.stringify(dataObj), { expirationTtl: 30 * 24 * 60 * 60 });
 			}
 
-			return resp;
+			return new Response(dataObj.content, { headers: { "content-type": "application/json" } });
 		}
 
 		return new Response("https://github.com/misieur/api.misieur.me", { status: 404 });
 	},
 
-	async scheduled(_controller: unknown, env: Env): Promise<void> {
-		const list = await env.BUCKET.list({ include: ["customMetadata"] });
-		const now = Date.now();
-		const threshold = 30 * 24 * 60 * 60 * 1000; // 30 days in milliseconds
-
-		for await (const item of list.objects) {
-			const meta = item.customMetadata;
-			let dateToCheck: number | null = null;
-
-			if (meta?.last_accessed_date) {
-				dateToCheck = Date.parse(meta.last_accessed_date + "T00:00:00.000Z");
-			} else if (meta?.created) {
-				dateToCheck = Date.parse(meta.created);
-			}
-
-			if (dateToCheck !== null) {
-				if (now - dateToCheck > threshold) {
-					await env.BUCKET.delete(item.key);
-				}
-			} else {
-				await env.BUCKET.delete(item.key); // Delete it if no date is found
-			}
-		}
-	}
 } satisfies ExportedHandler<Env>;
